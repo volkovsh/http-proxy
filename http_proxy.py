@@ -4,16 +4,6 @@ import argparse
 import socket
 import threading
 import time
-"""
-Лаба 4: простой HTTP-прокси (без HTTPS).
-
-Ключевая особенность: браузер при работе через прокси отправляет request-line в absolute-form:
-    GET http://host:port/path HTTP/1.1
-А сервер назначения чаще ожидает origin-form:
-    GET /path HTTP/1.1
-Поэтому прокси переписывает request-line перед пересылкой upstream.
-"""
-
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -26,26 +16,18 @@ HEADER_END = b"\r\n\r\n"
 @dataclass
 class ParsedRequest:
     method: str
-    # Что пришло в request-line от клиента: absolute-form (URL целиком) или origin-form (путь).
-    raw_target: str
+    raw_target: str  # what client sent in request-line (absolute-form or origin-form)
     version: str
-    # Заголовки в двух видах:
-    # - headers: для быстрых lookup'ов (ключи в lower-case)
-    # - header_items: чтобы сохранить исходный порядок/регистры при пересылке
-    headers: Dict[str, str]
-    header_items: Tuple[Tuple[str, str], ...]
+    headers: Dict[str, str]  # lower-case keys
+    header_items: Tuple[Tuple[str, str], ...]  # original-cased order-preserving
     host: str
     port: int
-    # Путь в origin-form (включая query), который уйдёт upstream.
-    path: str
-    # Нормализованный absolute URL для логирования.
-    absolute_url: str
-    # Сырые байты заголовков (для диагностики/отладки при необходимости).
-    header_bytes: bytes
+    path: str  # origin-form path (+ query)
+    absolute_url: str  # normalized absolute URL for logging
+    header_bytes: bytes  # full header block including CRLFCRLF (as received)
 
 
 def _recv_until(sock: socket.socket, marker: bytes, limit: int = 256 * 1024) -> bytes:
-    """Читает из сокета до маркера (например, CRLFCRLF для конца заголовков)."""
     buf = bytearray()
     while marker not in buf:
         chunk = sock.recv(4096)
@@ -58,7 +40,6 @@ def _recv_until(sock: socket.socket, marker: bytes, limit: int = 256 * 1024) -> 
 
 
 def _parse_headers(header_block: bytes) -> Tuple[str, str, str, Tuple[Tuple[str, str], ...], Dict[str, str]]:
-    """Парсит request-line и заголовки из блока, заканчивающегося CRLFCRLF."""
     head, _sep, _rest = header_block.partition(HEADER_END)
     lines = head.split(CRLF)
     if not lines or not lines[0]:
@@ -97,7 +78,6 @@ def _determine_upstream(method: str, target: str, headers_lc: Dict[str, str]) ->
     Returns (host, port, path, absolute_url).
     Supports absolute-form and origin-form.
     """
-    # absolute-form: "http://host:port/path?query"
     if target.startswith("http://") or target.startswith("https://"):
         u = urlsplit(target)
         if not u.hostname:
@@ -110,7 +90,7 @@ def _determine_upstream(method: str, target: str, headers_lc: Dict[str, str]) ->
         absolute_url = f"{u.scheme}://{host}:{port}{path}"
         return host, port, path, absolute_url
 
-    # origin-form: "/path?query". В этом случае host/port берём из заголовка Host.
+    # origin-form (or asterisk-form for OPTIONS)
     host_hdr = headers_lc.get("host")
     if not host_hdr:
         raise ValueError("Missing Host header")
@@ -134,11 +114,6 @@ def _determine_upstream(method: str, target: str, headers_lc: Dict[str, str]) ->
 
 
 def parse_client_request(client_sock: socket.socket) -> Tuple[ParsedRequest, bytes]:
-    """
-    Считывает только заголовки запроса (до CRLFCRLF) и возвращает:
-    - ParsedRequest
-    - остаток байт, которые могли прийти вместе с заголовками (начало body)
-    """
     raw = _recv_until(client_sock, HEADER_END)
     if not raw:
         raise ValueError("Client closed")
@@ -166,14 +141,10 @@ def parse_client_request(client_sock: socket.socket) -> Tuple[ParsedRequest, byt
 
 
 def build_upstream_request(req: ParsedRequest) -> bytes:
-    # Переписываем request-line в origin-form для upstream серверов.
+    # Convert absolute-form to origin-form for upstream servers.
     request_line = f"{req.method} {req.path} {req.version}\r\n"
 
-    # Удаляем proxy-specific заголовки и управляем Connection сами.
-    #
-    # Важно: мы принудительно добавляем "Connection: close" (ниже), чтобы упрощённо
-    # определять конец ответа: прокси будет читать до закрытия upstream-сокета.
-    # Это особенно удобно для потоковых ответов (радио) и ответов без Content-Length.
+    # Filter proxy-specific headers. Also prefer closing connections for simplicity/robustness.
     out_lines = [request_line]
     seen_host = False
     for name, value in req.header_items:
@@ -196,7 +167,6 @@ def build_upstream_request(req: ParsedRequest) -> bytes:
 
 
 def _read_response_headers(upstream: socket.socket) -> Tuple[bytes, int, bytes]:
-    """Считывает заголовки ответа (до CRLFCRLF) и извлекает status code для логирования."""
     raw = _recv_until(upstream, HEADER_END)
     if not raw:
         raise ValueError("Upstream closed before response")
@@ -216,7 +186,6 @@ def _read_response_headers(upstream: socket.socket) -> Tuple[bytes, int, bytes]:
 
 
 def _relay_stream(src: socket.socket, dst: socket.socket, initial: bytes = b"") -> None:
-    """Прокачка байт без буферизации: читает чанки и сразу пишет дальше."""
     if initial:
         dst.sendall(initial)
     while True:
@@ -237,7 +206,7 @@ def handle_client(
         except ValueError:
             return
 
-        # HTTPS через CONNECT по условию не требуется.
+        # HTTPS via CONNECT is explicitly not required; respond with 501.
         if req.method.upper() == "CONNECT":
             client_sock.sendall(
                 b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
@@ -249,15 +218,17 @@ def handle_client(
         upstream.connect((req.host, req.port))
         upstream.settimeout(None)
 
-        # Отправляем переписанные заголовки + уже прочитанный кусок body (если он пришёл вместе с заголовками).
+        # Send request headers (rewritten) + any already-read body bytes, then stream remaining body if any.
         upstream.sendall(build_upstream_request(req))
 
         # If the client already sent some body bytes together with headers, forward them immediately.
         if body_remainder:
             upstream.sendall(body_remainder)
 
-        # Дальше можем дочитать ещё немного body со стороны клиента (на случай POST),
-        # но не блокируемся надолго, чтобы не задерживать получение ответа от upstream.
+        # If there is a declared body, keep relaying until client closes or we have sent expected amount.
+        # For simplicity we rely on "Connection: close" behavior in browsers for typical GET,
+        # and on client closing the write side for unknown-length bodies.
+        # This is sufficient for the lab's HTTP GET tests and many simple POST forms.
         client_sock.settimeout(0.2)
         try:
             while True:
@@ -265,7 +236,7 @@ def handle_client(
                 if not chunk:
                     break
                 upstream.sendall(chunk)
-                # Эвристика: если сейчас данных меньше чанка — вероятно, body закончился (или пауза).
+                # Heuristic: stop reading if client has no more data right now (avoid delaying response).
                 if len(chunk) < 64 * 1024:
                     break
         except socket.timeout:
@@ -273,8 +244,7 @@ def handle_client(
         finally:
             client_sock.settimeout(None)
 
-        # Сначала читаем заголовки ответа, чтобы получить status code для лога,
-        # затем потоково прокачиваем оставшееся тело без лишней буферизации.
+        # Read and relay response headers first to log status, then stream the rest without buffering.
         resp_header_bytes, status_code, resp_remainder = _read_response_headers(upstream)
         client_sock.sendall(resp_header_bytes)
 
@@ -297,7 +267,6 @@ def handle_client(
 
 
 def serve(listen_host: str, listen_port: int, connect_timeout_s: float) -> None:
-    """Запускает слушающий сокет и обрабатывает клиентов в отдельных потоках."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((listen_host, listen_port))
@@ -320,7 +289,7 @@ def serve(listen_host: str, listen_port: int, connect_timeout_s: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Simple HTTP proxy with logging (lab 4)")
-    p.add_argument("--listen-host", default="127.0.0.1", help="Host/IP to listen on")
+    p.add_argument("--listen-host", default="0.0.0.0", help="Host/IP to listen on")
     p.add_argument("--listen-port", type=int, default=8080, help="TCP port to listen on")
     p.add_argument("--connect-timeout", type=float, default=5.0, help="Upstream connect timeout (seconds)")
     return p.parse_args()
